@@ -1730,3 +1730,96 @@ def test_retained_gateway_state_keeps_watchdog_degraded_like_startup_failed():
     assert status.retained_gateway_state({**watchdog, "desired_state": "stopped"}) == "stopped"
     assert status.retained_gateway_state({"gateway_state": "degraded", "exit_reason": None}) == "stopped"
     assert status.retained_gateway_state({"gateway_state": "startup_failed", "exit_reason": "x"}) == "startup_failed"
+
+
+class TestInlineGatewayBootstrapIdentity:
+    """Reuse upstream60e531 producer cases plus strict admission/replacement proof."""
+
+    @staticmethod
+    def forms(argv):
+        import base64
+
+        from hermes_cli import _launchers, venv_sync
+
+        root = Path("/fixture/Hermes Agent/hermes-agent")
+        python = Path("/fixture/python3")
+        script = _launchers._launcher_script("hermes", root, None)
+        return {
+            "store": _launchers.runtime_command(root, argv, python=python),
+            "published": [str(python), "-I", "-c", script, *argv],
+            "base64": [str(python), "-I", "-c",
+                       "import base64; exec(base64.b64decode("+
+                       repr(base64.b64encode(script.encode()).decode())+"))", *argv],
+            "reentry": venv_sync.relaunch_command(
+                python, root, [str(root/"hermes_cli/main.py"), *argv],
+                ["/old/python", "-m", "hermes_cli.main", *argv], "hermes_cli.main"),
+        }
+
+    @pytest.mark.parametrize("form", ["store", "published", "base64", "reentry"])
+    @pytest.mark.parametrize("join", ["space", "windows"])
+    def test_official_bootstrap_forms_are_runtime_identity(self, form, join):
+        import subprocess
+
+        argv = self.forms(["gateway", "run", "--external-supervisor"])[form]
+        command = " ".join(argv) if join == "space" else subprocess.list2cmdline(argv)
+        assert status.looks_like_gateway_command_line(command)
+        assert status.looks_like_gateway_runtime_command_line(command)
+
+    @pytest.mark.parametrize("case", ["status", "chat", "wrong_module", "unrelated_prefix", "watcher", "quoted_mention"])
+    @pytest.mark.parametrize("join", ["space", "windows"])
+    def test_other_source_or_non_run_command_is_not_runtime(self, case, join):
+        import subprocess
+
+        argv = self.forms(["gateway", "run"])["reentry"]
+        if case == "status":
+            argv = self.forms(["gateway", "status"])["reentry"]
+        elif case == "chat":
+            argv = self.forms(["chat"])["reentry"]
+        elif case == "wrong_module":
+            argv[-1] = argv[-1].replace("runpy.run_module('hermes_cli.main'", "runpy.run_module('fixture.other'")
+        elif case == "unrelated_prefix":
+            argv[-1] = "print('fixture'); " + argv[-1]
+        elif case == "watcher":
+            argv = [argv[0], "-c", "import os, sys, time\npid = int(sys.argv[1]); cmd = sys.argv[2:]\n", "1234", *argv]
+        else:
+            argv = [argv[0], "-c", "print('hermes_cli.main gateway run')"]
+        command = " ".join(argv) if join == "space" else subprocess.list2cmdline(argv)
+        assert not status.looks_like_gateway_runtime_command_line(command)
+
+    @classmethod
+    def fixture_metadata(cls, tmp_path, monkeypatch, command=None):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        record = {"pid": 123, "kind": "hermes-gateway", "start_time": 1000,
+                  "hermes_home": str(tmp_path), "argv": ["hermes", "gateway", "run"]}
+        for name in ("gateway.pid", "gateway.lock"):
+            (tmp_path/name).write_text(json.dumps(record))
+        monkeypatch.setattr(status, "_is_gateway_runtime_lock_active_strict", lambda _path: True)
+        monkeypatch.setattr(status, "is_gateway_runtime_lock_active", lambda _path: True)
+        monkeypatch.setattr(status, "_pid_exists", lambda _pid: True)
+        monkeypatch.setattr(status, "_get_process_start_time", lambda _pid: 1000)
+        if command is None:
+            command = " ".join(cls.forms(["gateway", "run"])["reentry"])
+        monkeypatch.setattr(status, "_read_process_cmdline", lambda _pid: command)
+        return {name: (tmp_path/name).read_bytes() for name in ("gateway.pid", "gateway.lock")}
+
+    def test_genuine_strict_api_admits_reentry_without_metadata_edits(self, tmp_path, monkeypatch):
+        before = self.fixture_metadata(tmp_path, monkeypatch)
+        assert status.get_running_pid_identity_strict(tmp_path/"gateway.pid") == (123, 1000.0)
+        assert before == {name:(tmp_path/name).read_bytes() for name in before}
+
+    def test_unchanged_supported_replacement_waiter_uses_same_repaired_status(self, tmp_path, monkeypatch):
+        from hermes_cli import gateway_supervised_restart
+
+        before = self.fixture_metadata(tmp_path, monkeypatch)
+        clock = iter((0, 1))
+        monkeypatch.setattr(gateway_supervised_restart.time, "monotonic", lambda: next(clock))
+        assert gateway_supervised_restart._wait_for_supervised_gateway_replacement(122, timeout=0.5, poll_interval=0) == 123
+        assert before == {name:(tmp_path/name).read_bytes() for name in before}
+
+    def test_strict_api_rejects_watcher_despite_legitimate_persisted_argv(self, tmp_path, monkeypatch):
+        argv = self.forms(["gateway", "run"])["reentry"]
+        watcher = " ".join([argv[0], "-c", "import os, sys, time\npid = int(sys.argv[1]); cmd = sys.argv[2:]\n", "1234", *argv])
+        before = self.fixture_metadata(tmp_path, monkeypatch, watcher)
+        with pytest.raises(RuntimeError, match="does not identify a live gateway"):
+            status.get_running_pid_identity_strict(tmp_path/"gateway.pid")
+        assert before == {name:(tmp_path/name).read_bytes() for name in before}
