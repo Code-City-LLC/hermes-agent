@@ -137,7 +137,40 @@ class ApiRequestHooksMixin:
             for key, value in (api_kwargs or {}).items()
             if key not in {"timeout", "http_client"}
         }
-        return self._sanitize_hook_payload({"method": "POST", "body": body})
+        payload = self._sanitize_hook_payload({"method": "POST", "body": body})
+        if not isinstance(payload, dict) or payload.get("_truncated") is not True:
+            return payload
+        # Keep only bounded public identity from this effective wire request. Never
+        # infer it from agent/profile defaults or a previous request; malformed or
+        # ambiguous values leave identity unavailable. Prompts, keys, headers and
+        # arbitrary extra_body values never enter this compact evidence.
+        identity = {}
+        for key in ("model", "reasoning_effort"):
+            if key in body:
+                value = body[key]
+                if not isinstance(value, str) or not 0 < len(value) <= 120:
+                    return payload
+                identity[key] = value
+        if "reasoning" in body:
+            reasoning = body["reasoning"]
+            if (not isinstance(reasoning, dict) or reasoning.get("_truncated")
+                    or not isinstance(reasoning.get("effort"), str)
+                    or not 0 < len(reasoning["effort"]) <= 120):
+                return payload
+            identity["reasoning"] = {"effort": reasoning["effort"]}
+        more = body.get("extra_body", {})
+        if (not isinstance(more, dict) or more.get("_truncated")
+                or {"model", "reasoning", "reasoning_effort"} & more.keys()):
+            return payload
+        if "thinking" in more:
+            thinking = more["thinking"]
+            if (not isinstance(thinking, dict) or set(thinking) != {"type"}
+                    or not isinstance(thinking["type"], str)
+                    or not 0 < len(thinking["type"]) <= 120):
+                return payload
+            identity["extra_body"] = {"thinking": {"type": thinking["type"]}}
+        payload["request_identity"] = {"version": 1, "body": identity}
+        return payload
 
     def _api_response_payload_for_hook(
         self, response: Any, assistant_message: Any, *, finish_reason: Optional[str]
