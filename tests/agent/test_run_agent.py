@@ -6783,3 +6783,69 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
+
+
+@pytest.mark.parametrize("wire_identity", [
+    {"model": "gpt-6.1-sol", "reasoning": {"effort": "medium"}},
+    {"model": "gpt-6.1-sol", "reasoning": {"effort": "low"}},
+    {"model": "deepseek-flash", "reasoning_effort": "high",
+     "extra_body": {"thinking": {"type": "enabled"}}},
+    {"model": "deepseek-flash", "extra_body": {"thinking": {"type": "disabled"}}},
+])
+def test_api_request_size_cap_preserves_only_current_public_identity(monkeypatch, wire_identity):
+    from agent.api_request_hooks import ApiRequestHooksMixin
+
+    monkeypatch.setenv("HERMES_PLUGIN_PAYLOAD_MAX_CHARS", "1000")
+    producer = ApiRequestHooksMixin()
+    # The first call is already capped. Identity sits after the large input, so
+    # a preview cannot attest it; no prior call or agent defaults supply it.
+    request = {
+        "input": [{"role": "user", "content": "private-content-" + "x" * 1800}
+                  for _ in range(8)],
+        **wire_identity,
+        "api_key": "synthetic-secret",
+        "extra_headers": {"Authorization": "synthetic-secret"},
+    }
+    compact = producer._api_request_payload_for_hook(request)
+    assert compact["_truncated"] is True
+    assert compact["request_identity"] == {"version": 1, "body": wire_identity}
+    assert "reasoning" not in compact["preview"]
+    public = json.dumps(compact["request_identity"])
+    assert all(value not in public for value in (
+        "private-content", "synthetic-secret", "Authorization", "extra_headers", "input"))
+    # A later request changes model and effort on the same producer instance.
+    changed = {"model": "current-model", "reasoning": {"effort": "high"}}
+    current = producer._api_request_payload_for_hook({"input": request["input"], **changed})
+    assert current["request_identity"] == {"version": 1, "body": changed}
+    # The ordinary hook's body and shape remain intact below the cap.
+    uncapped = {**wire_identity, "input": [{"role": "user", "content": "brief"}]}
+    assert producer._api_request_payload_for_hook(uncapped) == {"method": "POST", "body": uncapped}
+
+
+@pytest.mark.parametrize("wire_identity,expected", [
+    ({"model": "current-model"}, {"model": "current-model"}),
+    ({"reasoning": {"effort": "low"}}, {"reasoning": {"effort": "low"}}),
+    ({"model": "current-model", "reasoning": {"effort": None}}, None),
+    ({"model": "current-model", "reasoning": {"effort": "x" * 121}}, None),
+    ({"model": "current-model", "reasoning": {"effort": "medium", "_truncated": True}}, None),
+    ({"model": "current-model", "extra_body": {"model": "another-model"}}, None),
+    ({"model": "current-model", "extra_body": {"thinking": {"type": "enabled", "extra": True}}}, None),
+])
+def test_api_request_size_cap_never_fabricates_missing_or_ambiguous_identity(
+    monkeypatch, wire_identity, expected,
+):
+    from agent.api_request_hooks import ApiRequestHooksMixin
+
+    monkeypatch.setenv("HERMES_PLUGIN_PAYLOAD_MAX_CHARS", "1000")
+    producer = ApiRequestHooksMixin()
+    large_input = [{"content": "x" * 1800} for _ in range(8)]
+    producer._api_request_payload_for_hook({"input": large_input, "model": "old-model",
+                                          "reasoning": {"effort": "medium"}})
+    current = producer._api_request_payload_for_hook({"input": large_input, **wire_identity})
+    assert current["_truncated"] is True
+    if expected is None:
+        assert "request_identity" not in current
+    else:
+        # Partial current evidence stays partial: never fill absent fields from
+        # the earlier request or profile; consumers must require their own fields.
+        assert current["request_identity"] == {"version": 1, "body": expected}
